@@ -1,4 +1,8 @@
 import time
+import sys
+import inspect
+import functools
+import logging
 
 class TimerError(Exception):
     """Custom Timer Error used to report Timer failures"""
@@ -7,50 +11,103 @@ class TimerError(Exception):
 class Timer:
     
     def __init__(self, timing_func = time.perf_counter):
-        self._start_time = None
         self._timing_func = timing_func
+        self.aggregated_timers = dict()
 
-    def start(self):
-        if self._start_time is not None:
-            raise TimerError(f"Timer already running")
-        self._start_time = self._timing_func()
-    
-    def stop(self):
-        if self._start_time is None:
-            raise TimerError(f"Timer not running")
-        elapsed_time  =self._timing_func() - self._start_time
-        self._start_time = None
+    def set_dict_default_values(self,called_name, calling_name):
+        number_times_called = 0
+        current_elapsed_time_sum = 0
+        default_start_time = None
+        self.aggregated_timers.setdefault((called_name,calling_name),(number_times_called,default_start_time,current_elapsed_time_sum))
 
-        
+    def measure(self):
+        return self._timing_func()
 
-        return elapsed_time
+    def start(self,called_name = None,calling_name = None):
+        if called_name and calling_name:
+            current_time = self.measure()
+            self.set_dict_default_values(called_name,calling_name)
+            current_value = self.aggregated_timers[(called_name,calling_name)]
+            number_times_called = current_value[0]
+            current_elapsed_time_sum = current_value[2]
+            self.aggregated_timers[(called_name,calling_name)]=(number_times_called, current_time , current_elapsed_time_sum)
+        else:
+            raise TimerError(f"No function/parent function name given")
+
+    def stop(self, called_name = None,calling_name = None):
+        if called_name and calling_name:
+            current_value = self.aggregated_timers[(called_name,calling_name)]
+            number_times_called = current_value[0]
+            current_start_time = current_value[1]
+            elapsed_time_sum = current_value[2]
+            elapsed_time = self.measure() - current_start_time
+            self.aggregated_timers[(called_name,calling_name)]=(number_times_called+1,None, elapsed_time_sum+elapsed_time)
+        else:
+            raise TimerError(f"No function/parent function name given")
 
 class WallTimer(Timer):
-    aggregated_timers = dict()
-    def __init__(self,called_name = None,calling_name = None):
-        self.called_name = called_name
-        self.calling_name = calling_name
-        if self.called_name and self.calling_name:
-            self.aggregated_timers.setdefault((called_name,calling_name),0)
+    
+    def __init__(self):
         super().__init__(timing_func=time.perf_counter)
     
-    def stop(self):
-        elapsed_wall_time = super().stop()
-        if self.called_name and self.calling_name:
-            self.aggregated_timers[(self.called_name,self.calling_name)]+=elapsed_wall_time
-        return elapsed_wall_time
-
 class CPUTimer(Timer):
-    aggregated_timers = dict()
-    def __init__(self,called_name = None,calling_name = None):
-        self.called_name = called_name
-        self.calling_name = calling_name
-        if self.called_name and self.calling_name:
-            self.aggregated_timers.setdefault((called_name,calling_name),0)
+
+    def __init__(self):
         super().__init__(timing_func=time.process_time_ns)
+
+class Profiler:
+    def __init__(self):
+        self.wall_timer = WallTimer()
+        self.cpu_timer = CPUTimer()
+
+    def _profiler(self,frame,event,arg):
+        if frame.f_back is None:
+            return None
+        if (event is "call"):
+            function_name = frame.f_code.co_name
+            caller_function_name = frame.f_back.f_code.co_name
+            self.wall_timer.start(function_name, caller_function_name)
+            self.cpu_timer.start(function_name, caller_function_name)
+        
+        if (event is "c_call"):
+            function_name = arg.__name__
+            caller_function_name = frame.f_code.co_name
+            self.wall_timer.start(function_name, caller_function_name)
+            self.cpu_timer.start(function_name, caller_function_name)
+
+        if (event is "return"):
+            function_name = frame.f_code.co_name
+            caller_function_name = frame.f_back.f_code.co_name
+            self.wall_timer.stop(function_name, caller_function_name)
+            self.cpu_timer.stop(function_name, caller_function_name)
+
+        if (event is "c_return"):
+            function_name = arg.__name__
+            caller_function_name = frame.f_code.co_name
+            self.wall_timer.stop(function_name, caller_function_name)
+            self.cpu_timer.stop(function_name, caller_function_name)
+
+        if event is "c_exeption":
+            pass
     
-    def stop(self):
-        elapsed_cpu_time = super().stop()
-        if self.called_name and self.calling_name:
-            self.aggregated_timers[(self.called_name,self.calling_name)]+=elapsed_cpu_time
-        return elapsed_cpu_time
+    def profiling_results_printing(self):
+        wall_dict = self.wall_timer.aggregated_timers
+        cpu_dict = self.cpu_timer.aggregated_timers
+        results = [(k, cpu_dict[k][0], cpu_dict[k][2], wall_value[2]) for k, wall_value in wall_dict.items()]
+        for (called, calling), times_called, cpu_time, wall_time in results:
+            if times_called == 0:
+                continue
+            if calling is "wrapper_profiler":
+                calling = "<module>"
+            print(f"{calling}==>{called}//{times_called} {wall_time*1000:0.0f} {cpu_time}")
+
+def profile(func):
+    @functools.wraps(func)
+    def wrapper_profiler(*args, **kwargs):
+        profiler = Profiler()
+        sys.setprofile(profiler._profiler)
+        value = func(*args, **kwargs)
+        sys.setprofile(None)
+        profiler.profiling_results_printing()
+        return value
+    return wrapper_profiler
